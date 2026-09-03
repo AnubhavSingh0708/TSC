@@ -192,25 +192,29 @@ impl Payload {
             let body_start = idx;
             let body_len = if is_dual {
                 if is_min {
-                    let pub_len = block[idx] as usize;
-                    let pr_pos = idx + 1 + pub_len;
-                    let pr_len = block[pr_pos] as usize;
+                    let pub_len = *block.get(idx).ok_or(TSpineError::CorruptedBlock(block.len()))? as usize;
+                    let pr_pos = idx.checked_add(1 + pub_len).ok_or(TSpineError::CorruptedBlock(block.len()))?;
+                    let pr_len = *block.get(pr_pos).ok_or(TSpineError::CorruptedBlock(block.len()))? as usize;
                     1 + pub_len + 1 + pr_len
                 } else {
-                    let pub_len = u32::from_be_bytes(block[idx..idx + 4].try_into().unwrap()) as usize;
-                    let pr_pos = idx + 4 + pub_len;
-                    let pr_len = u32::from_be_bytes(block[pr_pos..pr_pos + 4].try_into().unwrap()) as usize;
+                    let slice4 = block.get(idx..idx + 4).ok_or(TSpineError::CorruptedBlock(block.len()))?;
+                    let pub_len = u32::from_be_bytes(slice4.try_into().unwrap()) as usize;
+                    let pr_pos = idx.checked_add(4 + pub_len).ok_or(TSpineError::CorruptedBlock(block.len()))?;
+                    let slice_pr = block.get(pr_pos..pr_pos + 4).ok_or(TSpineError::CorruptedBlock(block.len()))?;
+                    let pr_len = u32::from_be_bytes(slice_pr.try_into().unwrap()) as usize;
                     4 + pub_len + 4 + pr_len
                 }
             } else if is_min {
-                let p_len = block[idx] as usize;
+                let p_len = *block.get(idx).ok_or(TSpineError::CorruptedBlock(block.len()))? as usize;
                 1 + p_len
             } else {
-                let p_len = u32::from_be_bytes(block[idx..idx + 4].try_into().unwrap()) as usize;
+                let slice4 = block.get(idx..idx + 4).ok_or(TSpineError::CorruptedBlock(block.len()))?;
+                let p_len = u32::from_be_bytes(slice4.try_into().unwrap()) as usize;
                 4 + p_len
             };
 
-            let body_to_verify = &block[body_start..body_start + body_len];
+            let body_end = body_start.checked_add(body_len).ok_or(TSpineError::CorruptedBlock(block.len()))?;
+            let body_to_verify = block.get(body_start..body_end).ok_or(TSpineError::CorruptedBlock(block.len()))?;
             if let Some(vk) = verify_key {
                 if !Crypto::verify_hmac(vk, body_to_verify, sig) {
                     return Err(TSpineError::SignatureMismatch);
@@ -220,22 +224,30 @@ impl Payload {
 
         if is_dual {
             let (pub_bytes, priv_payload) = if is_min {
-                let pub_len = block[idx] as usize;
+                let pub_len = *block.get(idx).ok_or(TSpineError::CorruptedBlock(block.len()))? as usize;
                 idx += 1;
-                let pub_b = &block[idx..idx + pub_len];
-                idx += pub_len;
-                let priv_len = block[idx] as usize;
+                let end_pub = idx.checked_add(pub_len).ok_or(TSpineError::CorruptedBlock(block.len()))?;
+                let pub_b = block.get(idx..end_pub).ok_or(TSpineError::CorruptedBlock(block.len()))?;
+                idx = end_pub;
+
+                let priv_len = *block.get(idx).ok_or(TSpineError::CorruptedBlock(block.len()))? as usize;
                 idx += 1;
-                let priv_p = &block[idx..idx + priv_len];
+                let end_priv = idx.checked_add(priv_len).ok_or(TSpineError::CorruptedBlock(block.len()))?;
+                let priv_p = block.get(idx..end_priv).ok_or(TSpineError::CorruptedBlock(block.len()))?;
                 (pub_b, priv_p)
             } else {
-                let pub_len = u32::from_be_bytes(block[idx..idx + 4].try_into().unwrap()) as usize;
+                let slice4 = block.get(idx..idx + 4).ok_or(TSpineError::CorruptedBlock(block.len()))?;
+                let pub_len = u32::from_be_bytes(slice4.try_into().unwrap()) as usize;
                 idx += 4;
-                let pub_b = &block[idx..idx + pub_len];
-                idx += pub_len;
-                let priv_len = u32::from_be_bytes(block[idx..idx + 4].try_into().unwrap()) as usize;
+                let end_pub = idx.checked_add(pub_len).ok_or(TSpineError::CorruptedBlock(block.len()))?;
+                let pub_b = block.get(idx..end_pub).ok_or(TSpineError::CorruptedBlock(block.len()))?;
+                idx = end_pub;
+
+                let slice_pr = block.get(idx..idx + 4).ok_or(TSpineError::CorruptedBlock(block.len()))?;
+                let priv_len = u32::from_be_bytes(slice_pr.try_into().unwrap()) as usize;
                 idx += 4;
-                let priv_p = &block[idx..idx + priv_len];
+                let end_priv = idx.checked_add(priv_len).ok_or(TSpineError::CorruptedBlock(block.len()))?;
+                let priv_p = block.get(idx..end_priv).ok_or(TSpineError::CorruptedBlock(block.len()))?;
                 (pub_b, priv_p)
             };
 
@@ -279,13 +291,16 @@ impl Payload {
             })
         } else {
             let payload_bytes = if is_min {
-                let p_len = block[idx] as usize;
+                let p_len = *block.get(idx).ok_or(TSpineError::CorruptedBlock(block.len()))? as usize;
                 idx += 1;
-                &block[idx..idx + p_len]
+                let end = idx.checked_add(p_len).ok_or(TSpineError::CorruptedBlock(block.len()))?;
+                block.get(idx..end).ok_or(TSpineError::CorruptedBlock(block.len()))?
             } else {
-                let p_len = u32::from_be_bytes(block[idx..idx + 4].try_into().unwrap()) as usize;
+                let slice4 = block.get(idx..idx + 4).ok_or(TSpineError::CorruptedBlock(block.len()))?;
+                let p_len = u32::from_be_bytes(slice4.try_into().unwrap()) as usize;
                 idx += 4;
-                &block[idx..idx + p_len]
+                let end = idx.checked_add(p_len).ok_or(TSpineError::CorruptedBlock(block.len()))?;
+                block.get(idx..end).ok_or(TSpineError::CorruptedBlock(block.len()))?
             };
 
             let decrypted = if has_encryption {

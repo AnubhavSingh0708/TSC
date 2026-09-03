@@ -8,7 +8,7 @@ edition = "2021"
 tspine = { path = "../tsc" }
 
 # Web Framework & Async Runtime
-axum = { version = "0.7", features = ["multipart"] }
+axum = { version = "0.7", features = ["ws", "multipart"] }
 tokio = { version = "1", features = ["full"] }
 tower-http = { version = "0.5", features = ["cors", "trace"] }
 serde = { version = "1.0", features = ["derive"] }
@@ -17,3 +17,8 @@ serde_json = "1.0"
 # Image & Utilities
 image = { version = "0.25", default-features = false, features = ["png"] }
 tempfile = "3.10"
+
+# universal scaner implimentation
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+regex = "1.10"
+rsmpeg = { version = "0.16", features = ["link_system_ffmpeg"] }
