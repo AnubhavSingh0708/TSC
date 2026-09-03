@@ -37,7 +37,7 @@ impl UniversalScanResult {
 }
 
 // ============================================================================
-// 2D Geometry & Projective Homography
+// 2D Geometry, Line Representation & Projective Homography
 // ============================================================================
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -62,6 +62,72 @@ impl Point2D {
     #[inline]
     pub fn dist(&self, other: &Point2D) -> f32 {
         self.dist_sq(other).sqrt()
+    }
+}
+
+/// A 2D line represented in standard form: a*x + b*y + c = 0, with a^2 + b^2 = 1.
+#[derive(Debug, Clone, Copy)]
+pub struct Line2D {
+    pub a: f32,
+    pub b: f32,
+    pub c: f32,
+}
+
+impl Line2D {
+    pub fn new(a: f32, b: f32, c: f32) -> Self {
+        let norm = (a * a + b * b).sqrt().max(1e-7);
+        Self {
+            a: a / norm,
+            b: b / norm,
+            c: c / norm,
+        }
+    }
+
+    /// Fits a straight line to a set of points using Total Least Squares (orthogonal regression).
+    pub fn fit_orthogonal(pts: &[Point2D]) -> Option<Self> {
+        if pts.len() < 2 {
+            return None;
+        }
+
+        let n = pts.len() as f32;
+        let mut mx = 0.0f32;
+        let mut my = 0.0f32;
+        for p in pts {
+            mx += p.x;
+            my += p.y;
+        }
+        mx /= n;
+        my /= n;
+
+        let mut sxx = 0.0f32;
+        let mut syy = 0.0f32;
+        let mut sxy = 0.0f32;
+        for p in pts {
+            let dx = p.x - mx;
+            let dy = p.y - my;
+            sxx += dx * dx;
+            syy += dy * dy;
+            sxy += dx * dy;
+        }
+
+        // Angle of normal to the line
+        let theta = 0.5 * (2.0 * sxy).atan2(sxx - syy) + std::f32::consts::FRAC_PI_2;
+        let a = theta.cos();
+        let b = theta.sin();
+        let c = -(a * mx + b * my);
+
+        Some(Self::new(a, b, c))
+    }
+
+    /// Computes the intersection point of two lines.
+    pub fn intersect(&self, other: &Line2D) -> Option<Point2D> {
+        let det = self.a * other.b - self.b * other.a;
+        if det.abs() < 1e-5 {
+            return None;
+        }
+        let x = (self.b * other.c - other.b * self.c) / det;
+        let y = (other.a * self.c - self.a * other.c) / det;
+        Some(Point2D::new(x, y))
     }
 }
 
@@ -128,8 +194,27 @@ impl ProjectiveMapping {
 // ============================================================================
 
 #[inline]
+fn pixel_luminance(p: &image::Rgb<u8>) -> u8 {
+    ((77 * p[0] as u32 + 150 * p[1] as u32 + 29 * p[2] as u32) >> 8) as u8
+}
+
+#[inline]
+fn pixel_chroma(p: &image::Rgb<u8>) -> u8 {
+    let max_c = p[0].max(p[1]).max(p[2]);
+    let min_c = p[0].min(p[1]).min(p[2]);
+    max_c - min_c
+}
+
+#[inline]
 fn rgb_luminance(c: &Rgb) -> u8 {
     ((77 * c.0 as u32 + 150 * c.1 as u32 + 29 * c.2 as u32) >> 8) as u8
+}
+
+#[inline]
+fn rgb_chroma(c: &Rgb) -> u8 {
+    let max_c = c.0.max(c.1).max(c.2);
+    let min_c = c.0.min(c.1).min(c.2);
+    max_c - min_c
 }
 
 fn sample_bilinear(img: &RgbImage, x: f32, y: f32) -> Rgb {
@@ -161,49 +246,6 @@ fn sample_bilinear(img: &RgbImage, x: f32, y: f32) -> Rgb {
         out[c] = (top * (1.0 - fy) + bot * fy).round().clamp(0.0, 255.0) as u8;
     }
     Rgb(out[0], out[1], out[2])
-}
-
-// ============================================================================
-// Contour Extraction & Polygon Simplification
-// ============================================================================
-
-fn perpendicular_distance(p: Point2D, a: Point2D, b: Point2D) -> f32 {
-    let dx = b.x - a.x;
-    let dy = b.y - a.y;
-    let len_sq = dx * dx + dy * dy;
-    if len_sq < 1e-6 {
-        return p.dist(&a);
-    }
-    let num = (dy * p.x - dx * p.y + b.x * a.y - b.y * a.x).abs();
-    num / len_sq.sqrt()
-}
-
-fn ramer_douglas_peucker(points: &[Point2D], epsilon: f32) -> Vec<Point2D> {
-    if points.len() < 3 {
-        return points.to_vec();
-    }
-    let mut dmax = 0.0f32;
-    let mut index = 0;
-    let p_first = points[0];
-    let p_last = points[points.len() - 1];
-
-    for i in 1..(points.len() - 1) {
-        let d = perpendicular_distance(points[i], p_first, p_last);
-        if d > dmax {
-            index = i;
-            dmax = d;
-        }
-    }
-
-    if dmax > epsilon {
-        let mut left = ramer_douglas_peucker(&points[0..=index], epsilon);
-        let right = ramer_douglas_peucker(&points[index..], epsilon);
-        left.pop();
-        left.extend(right);
-        left
-    } else {
-        vec![p_first, p_last]
-    }
 }
 
 fn is_convex_quad(pts: &[Point2D]) -> bool {
@@ -258,53 +300,6 @@ impl Default for UniversalScanner {
             forced_size: None,
         }
     }
-}
-/// Extracts the 4 most prominent corner points from a slightly curved 5-7 point polygon
-fn extract_extreme_quad(pts: &[Point2D]) -> Option<[Point2D; 4]> {
-    if pts.len() < 4 {
-        return None;
-    }
-
-    // Centroid of the polygon
-    let mut cx = 0.0f32;
-    let mut cy = 0.0f32;
-    for p in pts {
-        cx += p.x;
-        cy += p.y;
-    }
-    cx /= pts.len() as f32;
-    cy /= pts.len() as f32;
-
-    // Find the furthest point in each of the 4 quadrants relative to centroid
-    let mut best: [Option<Point2D>; 4] = [None; 4];
-    let mut max_dist = [0.0f32; 4];
-
-    for p in pts {
-        let dx = p.x - cx;
-        let dy = p.y - cy;
-        let dist = dx * dx + dy * dy;
-
-        let quad_idx = match (dx >= 0.0, dy >= 0.0) {
-            (false, false) => 0, // Top-Left
-            (true, false) => 1,  // Top-Right
-            (true, true) => 2,   // Bottom-Right
-            (false, true) => 3,  // Bottom-Left
-        };
-
-        if dist > max_dist[quad_idx] {
-            max_dist[quad_idx] = dist;
-            best[quad_idx] = Some(*p);
-        }
-    }
-
-    if let (Some(p0), Some(p1), Some(p2), Some(p3)) = (best[0], best[1], best[2], best[3]) {
-        let candidate: [Point2D; 4] = [p0, p1, p2, p3];
-        if is_convex_quad(&candidate) {
-            return Some(candidate);
-        }
-    }
-
-    None
 }
 
 impl UniversalScanner {
@@ -378,13 +373,8 @@ impl UniversalScanner {
 
         let candidate_quads = self.detect_candidate_quads(img);
 
-        let modes_to_test = if let Some(m) = self.forced_mode {
-            vec![m]
-        } else {
-            vec![ColorMode::FourColor, ColorMode::EightColor, ColorMode::Monochrome]
-        };
-
         for quad in candidate_quads {
+            // Test 4 rotations to identify the correct orientation
             for rot in 0..4 {
                 let p0 = quad[rot];
                 let p1 = quad[(rot + 1) % 4];
@@ -396,15 +386,27 @@ impl UniversalScanner {
                     None => continue,
                 };
 
+                // Quick Top Bar check: Top edge (v=0.03) must be predominantly dark
+                let mut top_dark_samples = 0;
+                for step in 1..=5 {
+                    let u = step as f32 / 6.0;
+                    let (tx, ty) = mapping.map(u, 0.03);
+                    if rgb_luminance(&sample_bilinear(img, tx, ty)) < 130 {
+                        top_dark_samples += 1;
+                    }
+                }
+                if top_dark_samples < 3 {
+                    continue;
+                }
+
                 // Relative Orientation Filter:
-                // Bottom-Right must be visibly brighter than Bottom-Left
+                // In T-Spine Code: Bottom-Right is WHITE (0), Bottom-Left is BLACK (1)
                 let (br_x, br_y) = mapping.map(0.95, 0.95);
                 let (bl_x, bl_y) = mapping.map(0.05, 0.95);
                 let br_lum = rgb_luminance(&sample_bilinear(img, br_x, br_y)) as i32;
                 let bl_lum = rgb_luminance(&sample_bilinear(img, bl_x, bl_y)) as i32;
 
-                // Relative contrast check: avoids failing under bright or dim lighting
-                if br_lum - bl_lum < 25 {
+                if br_lum - bl_lum < 20 {
                     continue;
                 }
 
@@ -427,7 +429,7 @@ impl UniversalScanner {
                             continue;
                         }
 
-                        // Sample grid colors with bilinear interpolation
+                        // Sample grid colors with subpixel bilinear interpolation
                         let mut sampled_colors = vec![vec![Rgb(0, 0, 0); size]; size];
                         for y in 0..size {
                             let v = (y as f32 + 0.5) / size as f32;
@@ -438,20 +440,21 @@ impl UniversalScanner {
                             }
                         }
 
+                        // Intelligent Color Mode Detection
+                        let modes_to_test = if let Some(m) = self.forced_mode {
+                            vec![m]
+                        } else {
+                            self.determine_mode_test_order(&sampled_colors, size, is_nano)
+                        };
+
                         for &mode in &modes_to_test {
                             let mut grid = Grid::new(size, mode);
-                            let mut palette = Rgb::PALETTE[..mode.num_colors()].to_vec();
-
-                            if !is_nano {
-                                let spine_x = size / 2;
-                                for c in 0..mode.num_colors() {
-                                    // SAFE SUBTRACTION: Prevents attempt to subtract with overflow
-                                    if c + 1 < size {
-                                        let y_pos = size - 1 - c;
-                                        palette[c] = sampled_colors[y_pos][spine_x];
-                                    }
-                                }
-                            }
+                            let palette = self.build_calibrated_palette(
+                                &sampled_colors,
+                                size,
+                                mode,
+                                is_nano,
+                            );
 
                             for y in 0..size {
                                 for x in 0..size {
@@ -477,8 +480,12 @@ impl UniversalScanner {
 
                                 let text = match &payload {
                                     DecodedPayload::Text(s) => Some(s.clone()),
-                                    DecodedPayload::Dual { public_data, .. } => Some(public_data.clone()),
-                                    DecodedPayload::Binary(bytes) => String::from_utf8(bytes.clone()).ok(),
+                                    DecodedPayload::Dual { public_data, .. } => {
+                                        Some(public_data.clone())
+                                    }
+                                    DecodedPayload::Binary(bytes) => {
+                                        String::from_utf8(bytes.clone()).ok()
+                                    }
                                 };
 
                                 return Ok(UniversalScanResult {
@@ -488,7 +495,12 @@ impl UniversalScanner {
                                     size,
                                     is_nano,
                                     color_mode: mode,
-                                    corners: [(p0.x, p0.y), (p1.x, p1.y), (p2.x, p2.y), (p3.x, p3.y)],
+                                    corners: [
+                                        (p0.x, p0.y),
+                                        (p1.x, p1.y),
+                                        (p2.x, p2.y),
+                                        (p3.x, p3.y),
+                                    ],
                                 });
                             }
                         }
@@ -503,14 +515,166 @@ impl UniversalScanner {
     }
 
     // ========================================================================
-    // Computer Vision Pipeline Internals
+    // Robust Color Mode Identification & Palette Calibration
+    // ========================================================================
+
+    /// Dynamically determines the candidate test order for ColorMode.
+    /// Eliminates false positives (such as 2-color identified as 4-color, or 4-color as 8-color)
+    /// by combining spine calibration decoding with full-grid chromaticity analysis.
+    fn determine_mode_test_order(
+        &self,
+        sampled: &[Vec<Rgb>],
+        size: usize,
+        is_nano: bool,
+    ) -> Vec<ColorMode> {
+        let detected = self.identify_color_mode(sampled, size, is_nano);
+        match detected {
+            ColorMode::Monochrome => vec![
+                ColorMode::Monochrome,
+                ColorMode::FourColor,
+                ColorMode::EightColor,
+            ],
+            ColorMode::FourColor => vec![
+                ColorMode::FourColor,
+                ColorMode::EightColor,
+                ColorMode::Monochrome,
+            ],
+            ColorMode::EightColor => vec![
+                ColorMode::EightColor,
+                ColorMode::FourColor,
+                ColorMode::Monochrome,
+            ],
+        }
+    }
+
+    fn identify_color_mode(&self, sampled: &[Vec<Rgb>], size: usize, is_nano: bool) -> ColorMode {
+        // 1. Standard mode: inspect the spine calibration cells directly
+        if !is_nano && size >= 9 {
+            let spine_x = size / 2;
+
+            // In T-Spine:
+            // y = size - 1 -> White (c = 0)
+            // y = size - 2 -> Black (c = 1)
+            // y = size - 3 -> Red   (c = 2 in FourColor & EightColor; Black in Monochrome)
+            // y = size - 5 -> Green (c = 4 in EightColor; Black in FourColor & Monochrome)
+            let c_red_candidate = sampled[size - 3][spine_x];
+            let is_spine_red = c_red_candidate.0 > 100
+                && (c_red_candidate.0 as i32 - c_red_candidate.1 as i32) > 30
+                && (c_red_candidate.0 as i32 - c_red_candidate.2 as i32) > 30;
+
+            if is_spine_red {
+                if size >= 11 {
+                    let c_green_candidate = sampled[size - 5][spine_x];
+                    let is_spine_green = c_green_candidate.1 > 90
+                        && (c_green_candidate.1 as i32 - c_green_candidate.0 as i32) > 25
+                        && (c_green_candidate.1 as i32 - c_green_candidate.2 as i32) > 25;
+
+                    if is_spine_green {
+                        return ColorMode::EightColor;
+                    }
+                }
+                return ColorMode::FourColor;
+            } else {
+                // If cell at size - 3 is not Red, it cannot be 4-color or 8-color
+                return ColorMode::Monochrome;
+            }
+        }
+
+        // 2. Data cells chromaticity analysis (effective for Nano mode and fallback)
+        let data_coords = Grid::data_coordinates(size, is_nano);
+        let mut chromatic_count = 0;
+        let mut eight_color_only_count = 0;
+
+        for &(x, y) in &data_coords {
+            let c = sampled[y][x];
+            let chroma = rgb_chroma(&c);
+
+            if chroma > 45 {
+                chromatic_count += 1;
+
+                // EightColor unique signatures:
+                // Green: high G, low R, low B
+                // Cyan: high G & B, low R
+                // Yellow: high R & G, low B
+                // Magenta: high R & B, low G
+                let r = c.0 as i32;
+                let g = c.1 as i32;
+                let b = c.2 as i32;
+
+                let is_green = g > 90 && (g - r) > 25 && (g - b) > 25;
+                let is_cyan = g > 90 && b > 90 && (r < 80);
+                let is_yellow = r > 100 && g > 100 && (b < 80);
+                let is_magenta = r > 100 && b > 100 && (g < 80);
+
+                if is_green || is_cyan || is_yellow || is_magenta {
+                    eight_color_only_count += 1;
+                }
+            }
+        }
+
+        let total_cells = data_coords.len().max(1) as f32;
+        let chromatic_ratio = chromatic_count as f32 / total_cells;
+        let eight_color_ratio = eight_color_only_count as f32 / total_cells;
+
+        if chromatic_ratio < 0.03 {
+            ColorMode::Monochrome
+        } else if eight_color_ratio > 0.025 {
+            ColorMode::EightColor
+        } else {
+            ColorMode::FourColor
+        }
+    }
+
+    /// Builds a calibrated palette strictly bounded by the number of colors of the target mode.
+    /// Prevents black spine entries from bleeding into and corrupting color palettes.
+    fn build_calibrated_palette(
+        &self,
+        sampled: &[Vec<Rgb>],
+        size: usize,
+        mode: ColorMode,
+        is_nano: bool,
+    ) -> Vec<Rgb> {
+        let mut palette = Rgb::PALETTE[..mode.num_colors()].to_vec();
+
+        if !is_nano {
+            let spine_x = size / 2;
+            let num_colors = mode.num_colors();
+
+            // Calibrate strictly up to mode.num_colors()
+            for c in 0..num_colors {
+                if c + 1 < size {
+                    let y_pos = size - 1 - c;
+                    let sample = sampled[y_pos][spine_x];
+
+                    // Sanity check sample against expected color family
+                    let valid_sample = match c {
+                        0 => rgb_luminance(&sample) > 120,                          // White
+                        1 => rgb_luminance(&sample) < 135,                          // Black
+                        2 => sample.0 > 80 && sample.0 > sample.1 && sample.0 > sample.2, // Red
+                        3 => sample.2 > 80 && sample.2 > sample.0 && sample.2 > sample.1, // Blue
+                        4 => sample.1 > 80 && sample.1 > sample.0 && sample.1 > sample.2, // Green
+                        _ => true,
+                    };
+
+                    if valid_sample {
+                        palette[c] = sample;
+                    }
+                }
+            }
+        }
+
+        palette
+    }
+
+    // ========================================================================
+    // Computer Vision Pipeline: Side Detection & Corner Intersection
     // ========================================================================
 
     fn detect_candidate_quads(&self, img: &RgbImage) -> Vec<[Point2D; 4]> {
         let (w, h) = img.dimensions();
         let mut quads = Vec::new();
 
-        // 1. Full image bounding rectangle
+        // 1. Full image bounding rectangle (ideal for unpadded digital exports)
         quads.push([
             Point2D::new(0.0, 0.0),
             Point2D::new((w - 1) as f32, 0.0),
@@ -518,7 +682,7 @@ impl UniversalScanner {
             Point2D::new(0.0, (h - 1) as f32),
         ]);
 
-        // 2. Inset boxes for common quiet-zone margins (2%, 4%, 8%)
+        // 2. Fixed quiet-zone insets (2%, 4%, 8%)
         for &margin_pct in &[0.02, 0.04, 0.08] {
             let mx = (w as f32 * margin_pct).max(1.0);
             let my = (h as f32 * margin_pct).max(1.0);
@@ -532,7 +696,280 @@ impl UniversalScanner {
             }
         }
 
-        // 3. Multi-scale Adaptive Binarization and Contour Extraction
+        // 3. Side-detection from white background boundary transitions
+        if let Some(side_quad) = self.detect_quad_by_side_sweeping(img) {
+            quads.push(side_quad);
+        }
+
+        // 4. Black Bar + Spine detector with side verification
+        quads.extend(self.detect_quads_from_black_bars(img));
+
+        // 5. Adaptive contour line-segment intersection
+        quads.extend(self.detect_quads_from_contours(img));
+
+        // Deduplicate and filter degenerate quads
+        let mut unique_quads: Vec<[Point2D; 4]> = Vec::new();
+        for q in quads {
+            let area = polygon_area(&q);
+            if area < 100.0 {
+                continue;
+            }
+
+            let mut duplicate = false;
+            for u in &unique_quads {
+                let diff: f32 = (0..4).map(|i| q[i].dist(&u[i])).sum();
+                if diff < 12.0 {
+                    duplicate = true;
+                    break;
+                }
+            }
+            if !duplicate {
+                unique_quads.push(q);
+            }
+        }
+
+        unique_quads
+    }
+
+    /// Detects the 4 sides by ray-casting inwards from the image borders.
+    /// Since the barcode is framed by a uniform white background, the transition points
+    /// from white background to code modules define the 4 boundary lines.
+    /// Corners are computed as the exact intersection of these lines.
+    fn detect_quad_by_side_sweeping(&self, img: &RgbImage) -> Option<[Point2D; 4]> {
+        let (w, h) = img.dimensions();
+        if w < 20 || h < 20 {
+            return None;
+        }
+
+        // Estimate background luminance from the image corners
+        let c00 = pixel_luminance(img.get_pixel(0, 0));
+        let c10 = pixel_luminance(img.get_pixel(w - 1, 0));
+        let c01 = pixel_luminance(img.get_pixel(0, h - 1));
+        let c11 = pixel_luminance(img.get_pixel(w - 1, h - 1));
+        let bg_lum = ((c00 as u32 + c10 as u32 + c01 as u32 + c11 as u32) / 4) as u8;
+
+        if bg_lum < 160 {
+            return None; // Background is not sufficiently bright
+        }
+
+        let is_code_pixel = |p: &image::Rgb<u8>| -> bool {
+            let lum = pixel_luminance(p);
+            let chroma = pixel_chroma(p);
+            // Non-white code module: either significantly darker than background or colored
+            (lum as i32) < (bg_lum as i32 - 35) || chroma > 40
+        };
+
+        let num_rays = 32;
+        let mut top_pts = Vec::new();
+        let mut bottom_pts = Vec::new();
+        let mut left_pts = Vec::new();
+        let mut right_pts = Vec::new();
+
+        // Sweep vertically: Top & Bottom
+        for i in 1..num_rays {
+            let x = (i * w) / num_rays;
+
+            // From Top downward
+            for y in 0..(h / 2) {
+                if is_code_pixel(img.get_pixel(x, y)) {
+                    top_pts.push(Point2D::new(x as f32, y as f32));
+                    break;
+                }
+            }
+
+            // From Bottom upward
+            for y in (h / 2..h).rev() {
+                if is_code_pixel(img.get_pixel(x, y)) {
+                    bottom_pts.push(Point2D::new(x as f32, y as f32));
+                    break;
+                }
+            }
+        }
+
+        // Sweep horizontally: Left & Right
+        for i in 1..num_rays {
+            let y = (i * h) / num_rays;
+
+            // From Left inward
+            for x in 0..(w / 2) {
+                if is_code_pixel(img.get_pixel(x, y)) {
+                    left_pts.push(Point2D::new(x as f32, y as f32));
+                    break;
+                }
+            }
+
+            // From Right inward
+            for x in (w / 2..w).rev() {
+                if is_code_pixel(img.get_pixel(x, y)) {
+                    right_pts.push(Point2D::new(x as f32, y as f32));
+                    break;
+                }
+            }
+        }
+
+        if top_pts.len() < 4 || bottom_pts.len() < 4 || left_pts.len() < 4 || right_pts.len() < 4 {
+            return None;
+        }
+
+        let line_top = Line2D::fit_orthogonal(&top_pts)?;
+        let line_bottom = Line2D::fit_orthogonal(&bottom_pts)?;
+        let line_left = Line2D::fit_orthogonal(&left_pts)?;
+        let line_right = Line2D::fit_orthogonal(&right_pts)?;
+
+        let p_tl = line_top.intersect(&line_left)?;
+        let p_tr = line_top.intersect(&line_right)?;
+        let p_br = line_bottom.intersect(&line_right)?;
+        let p_bl = line_bottom.intersect(&line_left)?;
+
+        let quad = [p_tl, p_tr, p_br, p_bl];
+        if is_convex_quad(&quad) {
+            let area = polygon_area(&quad);
+            let d_top = p_tl.dist(&p_tr);
+            let d_left = p_tl.dist(&p_bl);
+            let aspect = d_top / d_left.max(1e-3);
+
+            if area > 120.0 && aspect > 0.6 && aspect < 1.6 {
+                return Some(quad);
+            }
+        }
+
+        None
+    }
+
+    /// Identifies the continuous horizontal black bar of the T-Spine,
+    /// checks for the vertical spine stem, and verifies companion sides.
+    /// Filters out spurious black bars (underlines, borders, table rules).
+    fn detect_quads_from_black_bars(&self, img: &RgbImage) -> Vec<[Point2D; 4]> {
+        let (w, h) = img.dimensions();
+        let mut quads = Vec::new();
+
+        let step_y = (h / 60).max(1);
+        for y in (2..h.saturating_sub(10)).step_by(step_y as usize) {
+            let mut dark_start = None;
+
+            for x in 0..w {
+                let lum = pixel_luminance(img.get_pixel(x, y));
+                let is_dark = lum < 110;
+
+                match (dark_start, is_dark) {
+                    (None, true) => dark_start = Some(x),
+                    (Some(start_x), false) => {
+                        let bar_len = x - start_x;
+                        if bar_len >= 20 {
+                            if let Some(quad) = self.verify_and_build_bar_quad(img, start_x, x - 1, y) {
+                                quads.push(quad);
+                            }
+                        }
+                        dark_start = None;
+                    }
+                    _ => {}
+                }
+            }
+
+            if let Some(start_x) = dark_start {
+                let bar_len = w - start_x;
+                if bar_len >= 20 {
+                    if let Some(quad) = self.verify_and_build_bar_quad(img, start_x, w - 1, y) {
+                        quads.push(quad);
+                    }
+                }
+            }
+        }
+
+        quads
+    }
+
+    /// Validates whether a candidate black bar belongs to a T-Spine code.
+    /// Rejects false positives by testing for the central stem and companion side boundaries.
+    fn verify_and_build_bar_quad(
+        &self,
+        img: &RgbImage,
+        x0: u32,
+        x1: u32,
+        y: u32,
+    ) -> Option<[Point2D; 4]> {
+        let (_, h) = img.dimensions();
+        let bar_len = (x1 - x0) as f32;
+        let expected_size = bar_len;
+
+        if y as f32 + expected_size * 0.7 > h as f32 {
+            return None;
+        }
+
+        // 1. Central Stem (Spine) Verification:
+        // A genuine T-Spine must have a vertical dark stem extending downward from near the center.
+        let mid_x = (x0 + x1) / 2;
+        let spine_check_depth = (expected_size * 0.45).min((h - 1 - y) as f32) as u32;
+        if spine_check_depth < 6 {
+            return None;
+        }
+
+        let mut spine_dark_count = 0;
+        for dy in 1..=spine_check_depth {
+            let lum = pixel_luminance(img.get_pixel(mid_x, y + dy));
+            if lum < 130 {
+                spine_dark_count += 1;
+            }
+        }
+
+        // If the central stem is absent (< 65% dark), this is an unwanted black bar (e.g. underline or border)
+        if spine_dark_count * 100 / spine_check_depth < 65 {
+            return None;
+        }
+
+        // 2. Flank Activity Check:
+        // Regions to the left and right of the spine stem must contain code modules,
+        // not uniform background or solid black fill.
+        let left_sample_x = x0 + (bar_len * 0.25) as u32;
+        let right_sample_x = x0 + (bar_len * 0.75) as u32;
+        let mid_y = y + (spine_check_depth / 2);
+
+        let lum_left = pixel_luminance(img.get_pixel(left_sample_x, mid_y));
+        let lum_right = pixel_luminance(img.get_pixel(right_sample_x, mid_y));
+
+        // Reject if entirely uniform or matches pure white background
+        if lum_left > 240 && lum_right > 240 {
+            return None;
+        }
+
+        // 3. Side & Bottom Boundary Matching:
+        // Find the bottom boundary by scanning upward around expected depth
+        let bottom_target_y = (y as f32 + expected_size).min((h - 1) as f32) as u32;
+        let mut detected_bottom_y = None;
+
+        let search_y_min = (y as f32 + expected_size * 0.7) as u32;
+        let search_y_max = (y as f32 + expected_size * 1.3).min((h - 1) as f32) as u32;
+
+        for check_y in (search_y_min..search_y_max).rev() {
+            let lum_bl = pixel_luminance(img.get_pixel(x0, check_y));
+            let lum_br = pixel_luminance(img.get_pixel(x1, check_y));
+
+            // Bottom row has black at bottom-left and white at bottom-right
+            if lum_bl < 130 && lum_br > 130 {
+                detected_bottom_y = Some(check_y);
+                break;
+            }
+        }
+
+        let bottom_y = detected_bottom_y.unwrap_or(bottom_target_y) as f32;
+
+        let p_tl = Point2D::new(x0 as f32, y as f32);
+        let p_tr = Point2D::new(x1 as f32, y as f32);
+        let p_br = Point2D::new(x1 as f32, bottom_y);
+        let p_bl = Point2D::new(x0 as f32, bottom_y);
+
+        let quad = [p_tl, p_tr, p_br, p_bl];
+        if is_convex_quad(&quad) {
+            Some(quad)
+        } else {
+            None
+        }
+    }
+
+    /// Enhanced contour-based quad extraction using robust side-line fitting.
+    /// Avoids cutting corners by intersecting fitted side lines.
+    fn detect_quads_from_contours(&self, img: &RgbImage) -> Vec<[Point2D; 4]> {
+        let (w, h) = img.dimensions();
         let max_dim = w.max(h);
         let scale = if max_dim > 700 {
             max_dim as f32 / 700.0
@@ -549,12 +986,10 @@ impl UniversalScanner {
             for sx in 0..sw {
                 let orig_x = (sx as f32 * scale).min((w - 1) as f32);
                 let p = img.get_pixel(orig_x as u32, orig_y as u32);
-                gray[(sy * sw + sx) as usize] =
-                    ((77 * p[0] as u32 + 150 * p[1] as u32 + 29 * p[2] as u32) >> 8) as u8;
+                gray[(sy * sw + sx) as usize] = pixel_luminance(p);
             }
         }
 
-        // Adaptive block size: larger window prevents quiet zones from washing out
         let block_size = 32u32;
         let blocks_x = (sw + block_size - 1) / block_size;
         let blocks_y = (sh + block_size - 1) / block_size;
@@ -579,7 +1014,6 @@ impl UniversalScanner {
             let by = (y / block_size).min(blocks_y.saturating_sub(1));
             for x in 0..sw {
                 let bx = (x / block_size).min(blocks_x.saturating_sub(1));
-                // Higher margin (10) provides cleaner edges in noisy lighting
                 let local_th = (block_means[(by * blocks_x + bx) as usize] as i32 - 10).max(15) as u8;
                 if gray[(y * sw + x) as usize] < local_th {
                     binary[(y * sw + x) as usize] = true;
@@ -604,72 +1038,97 @@ impl UniversalScanner {
             }
         }
 
-        // Polygon approximation with fallback corner reduction for slightly curved quads
+        let mut quads = Vec::new();
         for pts in detected_contours {
-            let mut perimeter = 0.0f32;
-            for i in 0..pts.len() {
-                perimeter += pts[i].dist(&pts[(i + 1) % pts.len()]);
+            // Find centroid
+            let mut cx = 0.0f32;
+            let mut cy = 0.0f32;
+            for p in &pts {
+                cx += p.x;
+                cy += p.y;
             }
+            cx /= pts.len() as f32;
+            cy /= pts.len() as f32;
 
-           for eps_factor in &[0.02, 0.035, 0.05, 0.075] {
-                let approx = ramer_douglas_peucker(&pts, perimeter * eps_factor);
-                let mut clean = approx;
-                if clean.len() > 1 && clean[0].dist(&clean[clean.len() - 1]) < 5.0 {
-                    clean.pop();
-                }
+            // Partition contour points into 4 sides based on quadrant angles
+            let mut side_top = Vec::new();
+            let mut side_right = Vec::new();
+            let mut side_bottom = Vec::new();
+            let mut side_left = Vec::new();
 
-                // Explicitly annotate type as Option<[Point2D; 4]>
-                let quad_candidate: Option<[Point2D; 4]> = if clean.len() == 4 && is_convex_quad(&clean) {
-                    Some([clean[0], clean[1], clean[2], clean[3]])
-                } else if clean.len() >= 5 && clean.len() <= 7 {
-                    extract_extreme_quad(&clean)
+            for p in &pts {
+                let dx = p.x - cx;
+                let dy = p.y - cy;
+                let angle = dy.atan2(dx); // -PI to +PI
+
+                if angle >= -std::f32::consts::FRAC_PI_4 * 3.0 && angle < -std::f32::consts::FRAC_PI_4 {
+                    side_top.push(*p);
+                } else if angle >= -std::f32::consts::FRAC_PI_4 && angle < std::f32::consts::FRAC_PI_4 {
+                    side_right.push(*p);
+                } else if angle >= std::f32::consts::FRAC_PI_4 && angle < std::f32::consts::FRAC_PI_4 * 3.0 {
+                    side_bottom.push(*p);
                 } else {
-                    None
-                };
+                    side_left.push(*p);
+                }
+            }
 
-                if let Some(cand) = quad_candidate {
-                    let area = polygon_area(&cand);
-                    let d01 = cand[0].dist(&cand[1]);
-                    let d12 = cand[1].dist(&cand[2]);
-                    let aspect = d01 / d12.max(1e-3);
+            if side_top.len() < 3 || side_right.len() < 3 || side_bottom.len() < 3 || side_left.len() < 3 {
+                continue;
+            }
 
-                    if area > 120.0 && aspect > 0.35 && aspect < 2.8 {
-                        let mut quad_pts = [
-                            Point2D::new(cand[0].x * scale, cand[0].y * scale),
-                            Point2D::new(cand[1].x * scale, cand[1].y * scale),
-                            Point2D::new(cand[2].x * scale, cand[2].y * scale),
-                            Point2D::new(cand[3].x * scale, cand[3].y * scale),
-                        ];
+            let l_top = match Line2D::fit_orthogonal(&side_top) {
+                Some(l) => l,
+                None => continue,
+            };
+            let l_right = match Line2D::fit_orthogonal(&side_right) {
+                Some(l) => l,
+                None => continue,
+            };
+            let l_bottom = match Line2D::fit_orthogonal(&side_bottom) {
+                Some(l) => l,
+                None => continue,
+            };
+            let l_left = match Line2D::fit_orthogonal(&side_left) {
+                Some(l) => l,
+                None => continue,
+            };
 
-                        let cross = (quad_pts[1].x - quad_pts[0].x) * (quad_pts[2].y - quad_pts[1].y)
-                            - (quad_pts[1].y - quad_pts[0].y) * (quad_pts[2].x - quad_pts[1].x);
-                        if cross < 0.0 {
-                            quad_pts.swap(1, 3);
-                        }
+            let p0 = match l_top.intersect(&l_left) {
+                Some(p) => Point2D::new(p.x * scale, p.y * scale),
+                None => continue,
+            };
+            let p1 = match l_top.intersect(&l_right) {
+                Some(p) => Point2D::new(p.x * scale, p.y * scale),
+                None => continue,
+            };
+            let p2 = match l_bottom.intersect(&l_right) {
+                Some(p) => Point2D::new(p.x * scale, p.y * scale),
+                None => continue,
+            };
+            let p3 = match l_bottom.intersect(&l_left) {
+                Some(p) => Point2D::new(p.x * scale, p.y * scale),
+                None => continue,
+            };
 
-                        quads.push(quad_pts);
-                        break;
-                    }
+            let mut quad = [p0, p1, p2, p3];
+            let area = polygon_area(&quad);
+            let d01 = quad[0].dist(&quad[1]);
+            let d12 = quad[1].dist(&quad[2]);
+            let aspect = d01 / d12.max(1e-3);
+
+            if area > 120.0 && aspect > 0.4 && aspect < 2.5 {
+                let cross = (quad[1].x - quad[0].x) * (quad[2].y - quad[1].y)
+                    - (quad[1].y - quad[0].y) * (quad[2].x - quad[1].x);
+                if cross < 0.0 {
+                    quad.swap(1, 3);
+                }
+                if is_convex_quad(&quad) {
+                    quads.push(quad);
                 }
             }
         }
 
-        let mut unique_quads: Vec<[Point2D; 4]> = Vec::new();
-        for q in quads {
-            let mut duplicate = false;
-            for u in &unique_quads {
-                let diff: f32 = (0..4).map(|i| q[i].dist(&u[i])).sum();
-                if diff < 15.0 {
-                    duplicate = true;
-                    break;
-                }
-            }
-            if !duplicate {
-                unique_quads.push(q);
-            }
-        }
-
-        unique_quads
+        quads
     }
 
     fn trace_boundary(
@@ -716,6 +1175,10 @@ impl UniversalScanner {
         contour
     }
 
+    // ========================================================================
+    // Grid Size & Skeleton Verification
+    // ========================================================================
+
     fn determine_candidate_sizes(&self, mapping: &ProjectiveMapping, img: &RgbImage) -> Vec<usize> {
         if let Some(forced) = self.forced_size {
             let odd = if forced % 2 == 0 { forced + 1 } else { forced };
@@ -738,7 +1201,11 @@ impl UniversalScanner {
         let mut prioritized = Vec::new();
         if dark_len > 0.003 && dark_len < 0.4 {
             let estimated_size = (1.0 / dark_len).round() as usize;
-            let center = if estimated_size % 2 == 0 { estimated_size + 1 } else { estimated_size };
+            let center = if estimated_size % 2 == 0 {
+                estimated_size + 1
+            } else {
+                estimated_size
+            };
             for delta in &[0isize, -2, 2, -4, 4, -6, 6] {
                 let sz = center as isize + delta;
                 if sz >= 5 && sz <= 251 {
@@ -763,18 +1230,24 @@ impl UniversalScanner {
         let (bl_x, bl_y) = mapping.map(0.5 / size as f32, (size as f32 - 0.5) / size as f32);
         let bl_lum = rgb_luminance(&sample_bilinear(img, bl_x, bl_y));
 
-        let (br_x, br_y) = mapping.map((size as f32 - 0.5) / size as f32, (size as f32 - 0.5) / size as f32);
+        let (br_x, br_y) = mapping.map(
+            (size as f32 - 0.5) / size as f32,
+            (size as f32 - 0.5) / size as f32,
+        );
         let br_lum = rgb_luminance(&sample_bilinear(img, br_x, br_y));
 
-        // Relative check: Bottom-Right must be brighter than Bottom-Left
-        if (br_lum as i32) - (bl_lum as i32) < 20 {
+        // Bottom-Right must be visibly brighter than Bottom-Left
+        if (br_lum as i32) - (bl_lum as i32) < 18 {
             return false;
         }
 
         if is_nano {
             let t_cells = [(0, 0), (1, 0), (2, 0), (1, 1)];
             for (cx, cy) in t_cells {
-                let (ix, iy) = mapping.map((cx as f32 + 0.5) / size as f32, (cy as f32 + 0.5) / size as f32);
+                let (ix, iy) = mapping.map(
+                    (cx as f32 + 0.5) / size as f32,
+                    (cy as f32 + 0.5) / size as f32,
+                );
                 if rgb_luminance(&sample_bilinear(img, ix, iy)) > br_lum.saturating_sub(15) {
                     return false;
                 }
@@ -784,18 +1257,25 @@ impl UniversalScanner {
             let check_len = size.saturating_sub(8).max(1);
             let mut spine_dark = 0;
             for y in 0..check_len {
-                let (ix, iy) = mapping.map((spine_x as f32 + 0.5) / size as f32, (y as f32 + 0.5) / size as f32);
+                let (ix, iy) = mapping.map(
+                    (spine_x as f32 + 0.5) / size as f32,
+                    (y as f32 + 0.5) / size as f32,
+                );
                 if rgb_luminance(&sample_bilinear(img, ix, iy)) < br_lum.saturating_sub(20) {
                     spine_dark += 1;
                 }
             }
-            if spine_dark * 100 / check_len < 70 {
+            if spine_dark * 100 / check_len < 65 {
                 return false;
             }
         }
 
         true
     }
+
+    // ========================================================================
+    // Confidence Computation
+    // ========================================================================
 
     fn compute_confidence(
         &self,
